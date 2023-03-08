@@ -104,7 +104,7 @@ class IDetect_3D(nn.Module):
     def __init__(self, nc=80, anchors=(), ch=()):  # detection layer
         super(IDetect, self).__init__()
         self.nc = nc  # number of classes
-        self.no = nc + 5  # number of outputs per anchor
+        self.no = nc + 5 + 7  # number of outputs per anchor, x,y,w,h,center3d_X, center3D_y, depth, h, w, l, alpha, conf, class score
         self.nl = len(anchors)  # number of detection layers
         self.na = len(anchors[0]) // 2  # number of anchors
         self.grid = [torch.zeros(1)] * self.nl  # init grid
@@ -133,6 +133,8 @@ class IDetect_3D(nn.Module):
                 y = x[i].sigmoid()
                 y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
                 y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
+
+                y[..., 4:6] = (y[..., 4:6] * 2. - 0.5 + self.grid[i]) * self.stride[i] # center3d xy
                 z.append(y.view(bs, -1, self.no))
 
         return x if self.training else (torch.cat(z, 1), x)
