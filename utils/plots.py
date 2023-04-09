@@ -17,6 +17,8 @@ import torch
 import yaml
 from PIL import Image, ImageDraw, ImageFont
 from scipy.signal import butter, filtfilt
+from visualize.show_2d3d_box import *
+from utils.trans_3d import *
 
 from utils.general import xywh2xyxy, xyxy2xywh
 from utils.metrics import fitness
@@ -67,6 +69,50 @@ def plot_one_box(x, img, color=None, label=None, line_thickness=3):
         cv2.rectangle(img, c1, c2, color, -1, cv2.LINE_AA)  # filled
         cv2.putText(img, label, (c1[0], c1[1] - 2), 0, tl / 3, [225, 255, 255], thickness=tf, lineType=cv2.LINE_AA)
 
+def plot_one_box_3d(x, img, p2, w2c, color=None, label=None, line_thickness=3):
+    # Plots one bounding box on image img
+    tl = line_thickness or round(0.002 * (img.shape[0] + img.shape[1]) / 2) + 1  # line/font thickness
+    color = color or [random.randint(0, 255) for _ in range(3)]
+    c1, c2 = (int(x[0]), int(x[1])), (int(x[2]), int(x[3]))
+    cv2.rectangle(img, c1, c2, (255, 255, 255), thickness=tl, lineType=cv2.LINE_AA)
+
+    camera2world = np.linalg.inv(w2c).reshape(4, 4)
+    cam_bottom_center = [x[7], x[8], x[9]]
+    center_3d_ground = p2[:3, :3] @ np.matrix(cam_bottom_center).T
+    center_3d_ground = center_3d_ground / center_3d_ground[2]
+    center_3d_ground_pixel = [int(center_3d_ground[0]), int(center_3d_ground[1])]
+    bottom_center_in_world = camera2world * np.matrix(cam_bottom_center + [1.0]).T
+    verts3d = project_3d_world(p2, bottom_center_in_world, x[5], x[4], x[6], x[10], camera2world)
+                
+    if verts3d is None:
+        pass
+    verts3d = verts3d.astype(np.int32)
+
+    # draw projection
+    cv2.line(img, tuple(verts3d[2]), tuple(verts3d[1]), color, thickness=tl, lineType=cv2.LINE_AA)
+    cv2.line(img, tuple(verts3d[1]), tuple(verts3d[0]), color, thickness=tl, lineType=cv2.LINE_AA)
+    cv2.line(img, tuple(verts3d[0]), tuple(verts3d[3]), color, thickness=tl, lineType=cv2.LINE_AA)
+    cv2.line(img, tuple(verts3d[2]), tuple(verts3d[3]), color, thickness=tl, lineType=cv2.LINE_AA)
+    cv2.line(img, tuple(verts3d[7]), tuple(verts3d[4]), color, thickness=tl, lineType=cv2.LINE_AA)
+    cv2.line(img, tuple(verts3d[4]), tuple(verts3d[5]), color, thickness=tl, lineType=cv2.LINE_AA)
+    cv2.line(img, tuple(verts3d[5]), tuple(verts3d[6]), color, thickness=tl, lineType=cv2.LINE_AA)
+    cv2.line(img, tuple(verts3d[6]), tuple(verts3d[7]), color, thickness=tl, lineType=cv2.LINE_AA)
+    cv2.line(img, tuple(verts3d[7]), tuple(verts3d[3]), color, thickness=tl, lineType=cv2.LINE_AA)
+    cv2.line(img, tuple(verts3d[1]), tuple(verts3d[5]), color, thickness=tl, lineType=cv2.LINE_AA)
+    cv2.line(img, tuple(verts3d[0]), tuple(verts3d[4]), color, thickness=tl, lineType=cv2.LINE_AA)
+    cv2.line(img, tuple(verts3d[2]), tuple(verts3d[6]), color, thickness=tl, lineType=cv2.LINE_AA)
+
+    cv2.circle(img, (center_3d_ground_pixel[0], center_3d_ground_pixel[1]), 2, color, 2)
+    
+
+    if label:
+        tf = max(tl - 1, 1)  # font thickness
+        t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
+        c2 = c1[0] + t_size[0], c1[1] - t_size[1] - 3
+        cv2.rectangle(img, c1, c2, color, -1, cv2.LINE_AA)  # filled
+        cv2.putText(img, label, (c1[0], c1[1] - 2), 0, tl / 3, [225, 255, 255], thickness=tf, lineType=cv2.LINE_AA)
+
+
 
 def plot_one_box_PIL(box, img, color=None, label=None, line_thickness=None):
     img = Image.fromarray(img)
@@ -106,8 +152,8 @@ def output_to_target(output):
     # Convert model output to target format [batch_id, class_id, x, y, w, h, conf]
     targets = []
     for i, o in enumerate(output):
-        for *box, conf, cls in o.cpu().numpy():
-            targets.append([i, cls, 0, 0, 0, *list(*xyxy2xywh(np.array(box)[None])), 0, 0, 0, 0, 0, 0, 0, conf])
+        for alpha, *box, h, w, l, X, Y, Z, ry, conf, cls in o.cpu().numpy():
+            targets.append([i, cls, 0, 0, alpha, *list(*xyxy2xywh(np.array(box)[None])), h, w, l, X, Y, Z, ry, conf])
     return np.array(targets)
 
 
@@ -191,6 +237,100 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max
         # cv2.imwrite(fname, cv2.cvtColor(mosaic, cv2.COLOR_BGR2RGB))  # cv2 save
         Image.fromarray(mosaic).save(fname)  # PIL save
     return mosaic
+
+def plot_images_3D(images, targets, p2s, w2cs, paths=None, fname='images.jpg', names=None, max_size=1920, max_subplots=16):
+    # Plot image grid with labels
+
+    if isinstance(images, torch.Tensor):
+        images = images.cpu().float().numpy()
+    if isinstance(targets, torch.Tensor):
+        targets = targets.cpu().numpy()
+
+    # un-normalise
+    if np.max(images[0]) <= 1:
+        images *= 255
+
+    tl = 1  # line thickness
+    tf = max(tl - 1, 1)  # font thickness
+    bs, _, h, w = images.shape  # batch size, _, height, width
+    bs = min(bs, max_subplots)  # limit plot images
+    ns = np.ceil(bs ** 0.5)  # number of subplots (square)
+
+    # Check if we should resize
+    scale_factor = max_size / max(h, w)
+    if scale_factor < 1:
+        h = math.ceil(scale_factor * h)
+        w = math.ceil(scale_factor * w)
+
+
+    colors = color_list()  # list of colors
+    mosaic = np.full((int(ns * h), int(ns * w), 3), 255, dtype=np.uint8)  # init
+    for i, img in enumerate(images):
+        if i == max_subplots:  # if last batch has fewer images than we expect
+            break
+        p2 = p2s[i, :].copy()
+        # print(p2)
+        w2c = w2cs[i, :]
+
+        block_x = int(w * (i // ns))
+        block_y = int(h * (i % ns))
+        p2[0,0] = p2[0,0] * w / img.shape[2]
+        p2[0,1] = p2[0,1] * w / img.shape[2]
+        p2[0,2] = p2[0,2] * w / img.shape[2]  + block_x
+        p2[1,1] = p2[1,1] * h/ img.shape[1]
+        p2[1,0] = p2[1,0] * h/ img.shape[1]
+        p2[1,2] = p2[1,2] * h/ img.shape[1]  + block_y
+
+        img = img.transpose(1, 2, 0)
+        if scale_factor < 1:
+            img = cv2.resize(img, (w, h))
+
+        mosaic[block_y:block_y + h, block_x:block_x + w, :] = img
+        if len(targets) > 0:
+            image_targets = targets[targets[:, 0] == i]
+            # boxes = xywh2xyxy(image_targets[:, 2:6]).T
+            # print(type(image_targets))
+            boxes = xywh2xyxy(image_targets[:, 5:9]).T
+            info_3d = image_targets[:, 9:16]
+
+            classes = image_targets[:, 1].astype('int')
+            labels = image_targets.shape[1] == 16  # labels if no conf column
+            # conf = None if labels else image_targets[:, 6]  # check for confidence presence (label vs pred)
+            conf = None if labels else image_targets[:, 16]  # check for confidence presence (label vs pred)
+
+            if boxes.shape[1]:
+                if boxes.max() <= 1.01:  # if normalized with tolerance 0.01
+                    boxes[[0, 2]] *= w  # scale to pixels
+                    boxes[[1, 3]] *= h
+                elif scale_factor < 1:  # absolute coords need scale if image scales
+                    boxes *= scale_factor
+            boxes[[0, 2]] += block_x
+            boxes[[1, 3]] += block_y
+            for j, box_3d in enumerate(np.concatenate((boxes.T, info_3d),1)):
+                cls = int(classes[j])
+                color = colors[cls % len(colors)]
+                cls = names[cls] if names else cls
+                if labels or conf[j] > 0.25:  # 0.25 conf thresh
+                    label = '%s' % cls if labels else '%s %.1f' % (cls, conf[j])
+                    plot_one_box_3d(box_3d, mosaic, p2, w2c, label=label, color=color, line_thickness=tl)
+
+        # Draw image filename labels
+        if paths:
+            label = Path(paths[i]).name[:40]  # trim to 40 char
+            t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
+            cv2.putText(mosaic, label, (block_x + 5, block_y + t_size[1] + 5), 0, tl / 3, [220, 220, 220], thickness=tf,
+                        lineType=cv2.LINE_AA)
+
+        # Image border
+        cv2.rectangle(mosaic, (block_x, block_y), (block_x + w, block_y + h), (255, 255, 255), thickness=3)
+
+    if fname:
+        r = min(1280. / max(h, w) / ns, 1.0)  # ratio to limit image size
+        mosaic = cv2.resize(mosaic, (int(ns * w * r), int(ns * h * r)), interpolation=cv2.INTER_AREA)
+        # cv2.imwrite(fname, cv2.cvtColor(mosaic, cv2.COLOR_BGR2RGB))  # cv2 save
+        Image.fromarray(mosaic).save(fname)  # PIL save
+    return mosaic
+
 
 
 def plot_lr_scheduler(optimizer, scheduler, epochs=300, save_dir=''):

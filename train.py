@@ -23,15 +23,15 @@ from tqdm import tqdm
 
 import test  # import test.py to get mAP after each epoch
 from models.experimental import attempt_load
-from models.yolo import Model
+from models.yolo import Model, Model_3D
 from utils.autoanchor import check_anchors
 from utils.datasets import create_dataloader, Rope3dDataSet, create_dataloader_Rope3D
 from utils.general import labels_to_class_weights, increment_path, labels_to_image_weights, init_seeds, \
     fitness, strip_optimizer, get_latest_run, check_dataset, check_file, check_git_status, check_img_size, \
     check_requirements, print_mutation, set_logging, one_cycle, colorstr
 from utils.google_utils import attempt_download
-from utils.loss import ComputeLoss, ComputeLossOTA
-from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
+from utils.loss import ComputeLoss, ComputeLossOTA, ComputeLoss_3D
+from utils.plots import plot_images,plot_images_3D, plot_labels, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
 
@@ -84,18 +84,18 @@ def train(hyp, opt, device, tb_writer=None):
     if pretrained:
         with torch_distributed_zero_first(rank):
             attempt_download(weights)  # download if not found locally
-        cp_weights = wdir / 'cp_weight.pt'
-        strip_optimizer(weights, cp_weights)
-        weights = cp_weights
+        # cp_weights = wdir / 'cp_weight.pt'
+        # strip_optimizer(weights, cp_weights)
+        # weights = cp_weights
         ckpt = torch.load(weights, map_location=device)  # load checkpoint
-        model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        model = Model_3D(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
         exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys
         state_dict = ckpt['model'].float().state_dict()  # to FP32
         state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(state_dict, strict=False)  # load
         logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
     else:
-        model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        model = Model_3D(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
     with torch_distributed_zero_first(rank):
         pass
         # check_dataset(data_dict)  # check
@@ -264,7 +264,7 @@ def train(hyp, opt, device, tb_writer=None):
         testloader = create_dataloader_Rope3D(test_path, imgsz_test, batch_size * 2, gs, opt,  # testloader
                                        hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True, rank=-1,
                                        world_size=opt.world_size, workers=opt.workers,
-                                       pad=0.5, prefix=colorstr('val: '))[0]
+                                       pad=0.0, prefix=colorstr('val: '))[0]
 
         if not opt.resume:
             labels = np.concatenate(dataset.labels, 0)
@@ -310,7 +310,9 @@ def train(hyp, opt, device, tb_writer=None):
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = amp.GradScaler(enabled=cuda)
     compute_loss_ota = ComputeLossOTA(model)  # init loss class
-    compute_loss = ComputeLoss(model)  # init loss class
+    # compute_loss = ComputeLoss(model)  # init loss class
+    compute_loss = ComputeLoss_3D(model, imgsz = imgsz)  # init loss class
+
     logger.info(f'Image sizes {imgsz} train, {imgsz_test} test\n'
                 f'Using {dataloader.num_workers} dataloader workers\n'
                 f'Logging results to {save_dir}\n'
@@ -337,17 +339,19 @@ def train(hyp, opt, device, tb_writer=None):
         # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
 
-        mloss = torch.zeros(4, device=device)  # mean losses
+        mloss = torch.zeros(8, device=device)  # mean losses
         if rank != -1:
             dataloader.sampler.set_epoch(epoch)
         pbar = enumerate(dataloader)
-        logger.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'total', 'labels', 'img_size'))
+        logger.info(('\n' + '%10s' * 12) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', '3d_c', 'dep', 'ang', 'dim', 'total', 'labels', 'img_size'))
         if rank in [-1, 0]:
             pbar = tqdm(pbar, total=nb)  # progress bar
         optimizer.zero_grad()
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+        for i, (imgs, targets, paths, _ , p2s, w2cs) in pbar:  # batch -------------------------------------------------------------
             ni = i + nb * epoch  # number integrated batches (since train start)
             imgs = imgs.to(device, non_blocking=True).float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
+            # p2s = p2s.to(device, non_blocking=True).float()
+            # w2cs = w2cs.to(device, non_blocking=True).float()
 
             # Warmup
             if ni <= nw:
@@ -374,7 +378,7 @@ def train(hyp, opt, device, tb_writer=None):
                 if 'loss_ota' not in hyp or hyp['loss_ota'] == 1:
                     loss, loss_items = compute_loss_ota(pred, targets.to(device), imgs)  # loss scaled by batch_size
                 else:
-                    loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+                    loss, loss_items = compute_loss(pred, targets.to(device), p2s, w2cs)  # loss scaled by batch_size
                 if rank != -1:
                     loss *= opt.world_size  # gradient averaged between devices in DDP mode
                 if opt.quad:
@@ -395,14 +399,14 @@ def train(hyp, opt, device, tb_writer=None):
             if rank in [-1, 0]:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
                 mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
-                s = ('%10s' * 2 + '%10.4g' * 6) % (
+                s = ('%10s' * 2 + '%10.4g' * 10) % (
                     '%g/%g' % (epoch, epochs - 1), mem, *mloss, targets.shape[0], imgs.shape[-1])
                 pbar.set_description(s)
 
-                # Plot
+                # Plot3
                 if plots and ni < 10:
                     f = save_dir / f'train_batch{ni}.jpg'  # filename
-                    Thread(target=plot_images, args=(imgs, targets, paths, f), daemon=True).start()
+                    Thread(target=plot_images_3D, args=(imgs, targets, p2s, w2cs, paths, f), daemon=True).start()
                     # if tb_writer:
                     #     tb_writer.add_image(f, result, dataformats='HWC', global_step=epoch)
                     #     tb_writer.add_graph(torch.jit.trace(model, imgs, strict=False), [])  # add model graph
@@ -441,14 +445,14 @@ def train(hyp, opt, device, tb_writer=None):
 
             # Write
             with open(results_file, 'a') as f:
-                f.write(s + '%10.4g' * 7 % results + '\n')  # append metrics, val_loss
+                f.write(s + '%10.4g' * 11 % results + '\n')  # append metrics, val_loss
             if len(opt.name) and opt.bucket:
                 os.system('gsutil cp %s gs://%s/results/results%s.txt' % (results_file, opt.bucket, opt.name))
 
-            # Log
-            tags = ['train/box_loss', 'train/obj_loss', 'train/cls_loss',  # train loss
+            # Log '3d_c', 'dep', 'ang', 'dim', 'total',
+            tags = ['train/box_loss', 'train/obj_loss', 'train/cls_loss', 'train/3d_c_loss', 'train/dep_loss', 'train/ang_loss','train/dim_loss', # train loss
                     'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95',
-                    'val/box_loss', 'val/obj_loss', 'val/cls_loss',  # val loss
+                    'val/box_loss', 'val/obj_loss', 'val/cls_loss', 'val/3d_c_loss', 'val/dep_loss', 'val/ang_loss','val/dim_loss', # val loss
                     'x/lr0', 'x/lr1', 'x/lr2']  # params
             for x, tag in zip(list(mloss[:-1]) + list(results) + lr, tags):
                 if tb_writer:

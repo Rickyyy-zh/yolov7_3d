@@ -217,5 +217,5 @@ head:
    [151, 1, RepConv, [512, 3, 1]],
    [164, 1, RepConv, [1024, 3, 1]],
 
-   [[165,166,167,168,169], 1, IDetect, [nc, anchors]],   # Detect(P2, P3, P4, P5, P6)
+   [[165,166,167,168,169], 1, IDetect_3D, [nc, anchors]],   # Detect(P2, P3, P4, P5, P6)
   ]

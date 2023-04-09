@@ -27,6 +27,9 @@ storage.googleapis.com
 runs/*
 data/*
 data/images/*
+outputs/
+evaluators/
+scripts/
 !data/*.yaml
 !data/hyps
 !data/scripts
@@ -264,3 +267,5 @@ fabric.properties
 
 rope*
 *.out
+det_evaluators.py
+evaluate.py

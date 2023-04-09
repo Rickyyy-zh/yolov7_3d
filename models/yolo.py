@@ -102,9 +102,9 @@ class IDetect_3D(nn.Module):
     concat = False
 
     def __init__(self, nc=80, anchors=(), ch=()):  # detection layer
-        super(IDetect, self).__init__()
+        super(IDetect_3D, self).__init__()
         self.nc = nc  # number of classes
-        self.no = nc + 5 + 7  # number of outputs per anchor, x,y,w,h,center3d_X, center3D_y, depth, h, w, l, alpha, conf, class score
+        self.no = nc + 5 + 9  # number of outputs per anchor, x,y,w,h,center3d_X, center3D_y, depth, depth_uncertainty, sin_alpha, cos_alpha, h, w, l, conf, class score
         self.nl = len(anchors)  # number of detection layers
         self.na = len(anchors[0]) // 2  # number of anchors
         self.grid = [torch.zeros(1)] * self.nl  # init grid
@@ -130,11 +130,15 @@ class IDetect_3D(nn.Module):
                 if self.grid[i].shape[2:4] != x[i].shape[2:4]:
                     self.grid[i] = self._make_grid(nx, ny).to(x[i].device)
 
-                y = x[i].sigmoid()
+                # indice_act = torch.tensor([0,1,2,3,4,5,13,14,15,16,17,18,19,20,21,22]).to(x[i].device)
+                y = torch.cat((x[i][..., :6].sigmoid(), x[i][..., 6:13], x[i][..., 13:].sigmoid()), -1)
+                # y.index_select(-1, indice_act).sigmoid()
+                # y[..., 4:6] = y[..., 4:6] + y[..., 0:2]
                 y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
                 y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
 
                 y[..., 4:6] = (y[..., 4:6] * 2. - 0.5 + self.grid[i]) * self.stride[i] # center3d xy
+                
                 z.append(y.view(bs, -1, self.no))
 
         return x if self.training else (torch.cat(z, 1), x)
@@ -847,7 +851,7 @@ class Model(nn.Module):
 
 class Model_3D(nn.Module):
     def __init__(self, cfg='yolor-csp-c.yaml', ch=3, nc=None, anchors=None):  # model, input channels, number of classes
-        super(Model, self).__init__()
+        super(Model_3D, self).__init__()
         self.traced = False
         if isinstance(cfg, dict):
             self.yaml = cfg  # model dict
@@ -880,6 +884,14 @@ class Model_3D(nn.Module):
             self._initialize_biases()  # only run once
             # print('Strides: %s' % m.stride.tolist())
         if isinstance(m, IDetect):
+            s = 256  # 2x min stride
+            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
+            check_anchor_order(m)
+            m.anchors /= m.stride.view(-1, 1, 1)
+            self.stride = m.stride
+            self._initialize_biases()  # only run once
+            # print('Strides: %s' % m.stride.tolist())
+        if isinstance(m, IDetect_3D):
             s = 256  # 2x min stride
             m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
             check_anchor_order(m)
@@ -1127,7 +1139,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             c2 = ch[f[0]]
         elif m is Foldcut:
             c2 = ch[f] // 2
-        elif m in [Detect, IDetect, IAuxDetect, IBin, IKeypoint]:
+        elif m in [Detect, IDetect, IAuxDetect, IBin, IKeypoint, IDetect_3D]:
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)

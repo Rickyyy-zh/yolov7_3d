@@ -10,19 +10,37 @@ import yaml
 from tqdm import tqdm
 
 from models.experimental import attempt_load
-from utils.datasets import create_dataloader
+from utils.datasets import create_dataloader, create_dataloader_Rope3D
 from utils.general import coco80_to_coco91_class, check_dataset, check_file, check_img_size, check_requirements, \
-    box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr
+    box_iou, non_max_suppression,non_max_suppression_3D, scale_coords, scale_coords_3D, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr
 from utils.metrics import ap_per_class, ConfusionMatrix
-from utils.plots import plot_images, output_to_target, plot_study_txt
+from utils.loss import ComputeLoss_3D
+from utils.plots import plot_images, plot_images_3D, output_to_target, plot_study_txt
 from utils.torch_utils import select_device, time_synchronized, TracedModel
+from utils.trans_3d import decodePred
+from utils.trans_3d import *
 
+CLASS = ['car', 'van', 'truck', 'bus', 'pedestrian', 'cyclist', 'motorcyclist', 'barrow', 'tricyclist']
+
+def buildTar(targets, p2s, w2cs):
+    out = [torch.zeros((0, 15), device=targets.device).float()] * p2s.shape[0]
+    targets_1 = targets[:, 0:1]
+    tar_cls = targets[:, 1:2]
+    targets_2 =xywh2xyxy(targets[:, 5:9]) # 2d xyxy
+    indice = torch.tensor([0, 4, 9, 10, 11, 12, 13, 14, 15],device= targets.device)
+    targets_3, depth, alpha_vec, dims = trans3dPoint2Pixel(targets.index_select(1, indice), p2s, w2cs) #3dcenterxy, depth, [sin a, cos a], dim hwl
+    conf = torch.ones(depth.unsqueeze(1).shape).to(targets.device)
+    targets_out = torch.cat((targets_1,targets_2, targets_3, depth.unsqueeze(1), depth.unsqueeze(1), alpha_vec, dims, conf, tar_cls), 1) # index, cls, 2d box, 3dcenterxy
+    for bs, res in enumerate(out):
+        mask = targets_out[:, 0] == bs
+        out[bs] = targets_out[mask][:,1:].float()
+    return out
 
 def test(data,
          weights=None,
          batch_size=32,
          imgsz=640,
-         conf_thres=0.001,
+         conf_thres=0.4,
          iou_thres=0.6,  # for NMS
          save_json=False,
          single_cls=False,
@@ -87,7 +105,7 @@ def test(data,
         if device.type != 'cpu':
             model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
         task = opt.task if opt.task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
-        dataloader = create_dataloader(data[task], imgsz, batch_size, gs, opt, pad=0.5, rect=True,
+        dataloader = create_dataloader_Rope3D(data[task], imgsz, batch_size, gs, opt, rect=True,
                                        prefix=colorstr(f'{task}: '))[0]
 
     if v5_metric:
@@ -99,15 +117,14 @@ def test(data,
     coco91class = coco80_to_coco91_class()
     s = ('%20s' + '%12s' * 6) % ('Class', 'Images', 'Labels', 'P', 'R', 'mAP@.5', 'mAP@.5:.95')
     p, r, f1, mp, mr, map50, map, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
-    loss = torch.zeros(3, device=device)
+    loss = torch.zeros(7, device=device)
     jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
-    for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
+    for batch_i, (img, targets, paths, shapes, p2s, w2cs) in enumerate(tqdm(dataloader, desc=s)):
         img = img.to(device, non_blocking=True)
         img = img.half() if half else img.float()  # uint8 to fp16/32
         img /= 255.0  # 0 - 255 to 0.0 - 1.0
         targets = targets.to(device)
         nb, _, height, width = img.shape  # batch size, channels, height, width
-
         with torch.no_grad():
             # Run model
             t = time_synchronized()
@@ -116,18 +133,27 @@ def test(data,
 
             # Compute loss
             if compute_loss:
-                loss += compute_loss([x.float() for x in train_out], targets)[1][:3]  # box, obj, cls
+                loss += compute_loss([x.float() for x in train_out], targets, p2s, w2cs)[1][:7]  # box, obj, cls
 
             # Run NMS
             # targets[:, 2:] *= torch.Tensor([width, height, width, height]).to(device)  # to pixels
             targets[:, 5:9] *= torch.Tensor([width, height, width, height]).to(device)  # to pixels
 
-            lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
+            # lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
             t = time_synchronized()
-            out = non_max_suppression(out, conf_thres=conf_thres, iou_thres=iou_thres, labels=lb, multi_label=False)
+            out = non_max_suppression_3D(out, conf_thres=conf_thres, iou_thres=iou_thres, multi_label=False)
             t1 += time_synchronized() - t
 
+        # out_gt = buildTar(targets, p2s, w2cs)
         # Statistics per image
+        decode_out = []
+        # gt_out = []
+
+        # for i, gt_tar in enumerate(out_gt):
+        #     gt = gt_tar.clone()
+        #     gt, alphas = decodePred(gt, p2s[i], w2cs[i], shapes[i])
+        #     gt_out.append(torch.cat((alphas, gt), 1))
+
         for si, pred in enumerate(out):
             labels = targets[targets[:, 0] == si, 1:]
             nl = len(labels)
@@ -142,15 +168,21 @@ def test(data,
 
             # Predictions
             predn = pred.clone()
+            predn, alphas = decodePred(predn, p2s[si], w2cs[si], shapes[si])
+            decode_out.append(torch.cat((alphas, predn), 1))
             scale_coords(img[si].shape[1:], predn[:, :4], shapes[si][0], shapes[si][1])  # native-space pred
 
             # Append to text file
             if save_txt:
                 gn = torch.tensor(shapes[si][0])[[1, 0, 1, 0]]  # normalization gain whwh
-                for *xyxy, conf, cls in predn.tolist():
+                for i, (*xyxy, h, w, l, X, Y, Z, ry, conf, cls) in enumerate(predn.tolist()):
+                    if conf < conf_thres:
+                        continue
+                    cls_ = CLASS[int(cls)]
                     xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-                    line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
+                    line = (0, 0, alphas[i].item(), *xyxy, h, w, l, X, Y, Z, ry, conf) if save_conf else (0, 0, alphas[i].item(), *xyxy, h, w, l, X, Y, Z, ry)  # label format
                     with open(save_dir / 'labels' / (path.stem + '.txt'), 'a') as f:
+                        f.write(cls_ + " ")
                         f.write(('%g ' * len(line)).rstrip() % line + '\n')
 
             # W&B logging - Media Panel Plots
@@ -193,7 +225,7 @@ def test(data,
                 # Per target class
                 for cls in torch.unique(tcls_tensor):
                     ti = (cls == tcls_tensor).nonzero(as_tuple=False).view(-1)  # prediction indices
-                    pi = (cls == pred[:, 5]).nonzero(as_tuple=False).view(-1)  # target indices
+                    pi = (cls == pred[:, 14]).nonzero(as_tuple=False).view(-1)  # target indices
 
                     # Search for detections
                     if pi.shape[0]:
@@ -212,14 +244,16 @@ def test(data,
                                     break
 
             # Append statistics (correct, conf, pcls, tcls)
-            stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
+            stats.append((correct.cpu(), pred[:, 13].cpu(), pred[:, 14].cpu(), tcls))
 
         # Plot images
-        if plots and batch_i < 3:
+        if plots and batch_i < 50:
             f = save_dir / f'test_batch{batch_i}_labels.jpg'  # labels
-            Thread(target=plot_images, args=(img, targets, paths, f, names), daemon=True).start()
+            Thread(target=plot_images_3D, args=(img, targets, p2s, w2cs, paths, f, names), daemon=True).start()
+            # plot_images_3D(img, targets, p2s, w2cs, paths, f, names)
             f = save_dir / f'test_batch{batch_i}_pred.jpg'  # predictions
-            Thread(target=plot_images, args=(img, output_to_target(out), paths, f, names), daemon=True).start()
+            Thread(target=plot_images_3D, args=(img, output_to_target(decode_out), p2s, w2cs, paths, f, names), daemon=True).start()
+            # plot_images_3D(img,  output_to_target(decode_out), p2s, w2cs, paths, f, names)
 
     # Compute statistics
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy

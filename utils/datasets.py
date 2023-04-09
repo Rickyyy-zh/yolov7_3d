@@ -19,6 +19,8 @@ import torch.nn.functional as F
 from PIL import Image, ExifTags
 from torch.utils.data import Dataset
 from tqdm import tqdm
+import yaml
+from pyquaternion import Quaternion
 
 import pickle
 from copy import deepcopy
@@ -62,7 +64,8 @@ def exif_size(img):
     return s
 
 CLASS_ = {'car': '0', 'van': '1', 'truck': '2', 'bus': '3', 'pedestrian': '4', 'cyclist': '5', 'motorcyclist': '6', 'barrow': '7', 'tricyclist': '8'}
-
+category_map_rope3d = {"car": "Car", "van": "Car", "truck": "Bus", "bus": "Bus", "pedestrian": "Pedestrian", "bicycle": "Cyclist", "trailer": "Cyclist", "motorcycle": "Cyclist"}
+CLASS_ropekitti = {"Car": "0", "Bus": "1", "Pedestrian": "2", "Cyclist": "3"}
 def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
                       rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix=''):
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
@@ -154,6 +157,85 @@ class _RepeatSampler(object):
 
 
 class LoadImages:  # for inference
+    def __init__(self, path, img_size=640, stride=32):
+        p = str(Path(path).absolute())  # os-agnostic absolute path
+        if '*' in p:
+            files = sorted(glob.glob(p, recursive=True))  # glob
+        elif os.path.isdir(p):
+            files = sorted(glob.glob(os.path.join(p, '*.*')))  # dir
+        elif os.path.isfile(p):
+            files = [p]  # files
+        else:
+            raise Exception(f'ERROR: {p} does not exist')
+
+        images = [x for x in files if x.split('.')[-1].lower() in img_formats]
+        videos = [x for x in files if x.split('.')[-1].lower() in vid_formats]
+        ni, nv = len(images), len(videos)
+
+        self.img_size = img_size
+        self.stride = stride
+        self.files = images + videos
+        self.nf = ni + nv  # number of files
+        self.video_flag = [False] * ni + [True] * nv
+        self.mode = 'image'
+        if any(videos):
+            self.new_video(videos[0])  # new video
+        else:
+            self.cap = None
+        assert self.nf > 0, f'No images or videos found in {p}. ' \
+                            f'Supported formats are:\nimages: {img_formats}\nvideos: {vid_formats}'
+
+    def __iter__(self):
+        self.count = 0
+        return self
+
+    def __next__(self):
+        if self.count == self.nf:
+            raise StopIteration
+        path = self.files[self.count]
+
+        if self.video_flag[self.count]:
+            # Read video
+            self.mode = 'video'
+            ret_val, img0 = self.cap.read()
+            if not ret_val:
+                self.count += 1
+                self.cap.release()
+                if self.count == self.nf:  # last video
+                    raise StopIteration
+                else:
+                    path = self.files[self.count]
+                    self.new_video(path)
+                    ret_val, img0 = self.cap.read()
+
+            self.frame += 1
+            print(f'video {self.count + 1}/{self.nf} ({self.frame}/{self.nframes}) {path}: ', end='')
+
+        else:
+            # Read image
+            self.count += 1
+            img0 = cv2.imread(path)  # BGR
+            assert img0 is not None, 'Image Not Found ' + path
+            #print(f'image {self.count}/{self.nf} {path}: ', end='')
+
+        # Padded resize
+        img = letterbox(img0, self.img_size, stride=self.stride)[0]
+
+        # Convert
+        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
+        img = np.ascontiguousarray(img)
+
+        return path, img, img0, self.cap
+
+    def new_video(self, path):
+        self.frame = 0
+        self.cap = cv2.VideoCapture(path)
+        self.nframes = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    def __len__(self):
+        return self.nf  # number of files
+
+class LoadImages_3D:  # for inference
     def __init__(self, path, img_size=640, stride=32):
         p = str(Path(path).absolute())  # os-agnostic absolute path
         if '*' in p:
@@ -376,6 +458,20 @@ def img2label_paths(img_paths):
     # Define label paths as a function of image paths
     # sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
     sa, sb = os.sep + 'image' + os.sep, os.sep + 'label' + os.sep  # /images/, /labels/ substrings
+
+    return ['txt'.join(x.replace(sa, sb, 1).rsplit(x.split('.')[-1], 1)) for x in img_paths]
+
+def img2ext_paths(img_paths):
+    # Define label paths as a function of image paths
+    # sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
+    sa, sb = os.sep + 'image' + os.sep, os.sep + 'extrinsics' + os.sep  # /images/, /labels/ substrings
+
+    return ['yaml'.join(x.replace(sa, sb, 1).rsplit(x.split('.')[-1], 1)) for x in img_paths]
+
+def img2calib_paths(img_paths):
+    # Define label paths as a function of image paths
+    # sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
+    sa, sb = os.sep + 'image' + os.sep, os.sep + 'calib' + os.sep  # /images/, /labels/ substrings
 
     return ['txt'.join(x.replace(sa, sb, 1).rsplit(x.split('.')[-1], 1)) for x in img_paths]
 
@@ -727,6 +823,9 @@ class Rope3dDataSet(Dataset):  # for training/testing
 
         # Check cache
         self.label_files = img2label_paths(self.img_files)  # labels
+        self.ext_files = img2ext_paths(self.img_files)
+        self.calib_files = img2calib_paths(self.img_files)
+
         cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')  # cached labels
         if cache_path.is_file():
             cache, exists = torch.load(cache_path), True  # load
@@ -745,11 +844,15 @@ class Rope3dDataSet(Dataset):  # for training/testing
         # Read cache
         cache.pop('hash')  # remove hash
         cache.pop('version')  # remove version
-        labels, shapes, self.segments = zip(*cache.values())
+        # labels, shapes, self.segments = zip(*cache.values())
+        labels, shapes, w2c_mats, p2_mats = zip(*cache.values())
+
         self.labels = list(labels)
         self.shapes = np.array(shapes, dtype=np.float64)
         self.img_files = list(cache.keys())  # update
         self.label_files = img2label_paths(cache.keys())  # update
+        self.w2c_mats = list(w2c_mats)
+        self.p2_mats = list(p2_mats)
         if single_cls:
             for x in self.labels:
                 x[:, 0] = 0
@@ -771,6 +874,8 @@ class Rope3dDataSet(Dataset):  # for training/testing
             self.label_files = [self.label_files[i] for i in irect]
             self.labels = [self.labels[i] for i in irect]
             self.shapes = s[irect]  # wh
+            self.w2c_mats = [self.w2c_mats[i] for i in irect]
+            self.p2_mats = [self.p2_mats[i] for i in irect]
             ar = ar[irect]
 
             # Set training image shapes
@@ -811,8 +916,8 @@ class Rope3dDataSet(Dataset):  # for training/testing
         # Cache dataset labels, check images and read shapes
         x = {}  # dict
         nm, nf, ne, nc = 0, 0, 0, 0  # number missing, found, empty, duplicate
-        pbar = tqdm(zip(self.img_files, self.label_files), desc='Scanning images', total=len(self.img_files))
-        for i, (im_file, lb_file) in enumerate(pbar):
+        pbar = tqdm(zip(self.img_files, self.label_files, self.ext_files, self.calib_files), desc='Scanning images', total=len(self.img_files))
+        for i, (im_file, lb_file, ext_file, calib_file) in enumerate(pbar):
             try:
                 # verify images
                 im = Image.open(im_file)
@@ -833,6 +938,9 @@ class Rope3dDataSet(Dataset):  # for training/testing
                                 x_[0] = CLASS_[x_[0]]
                             else:
                                 continue
+                            
+                            if float(x_[8]) <= 0.05 and float(x_[9]) <= 0.05 and float(x_[10]) <= 0.05:
+                                continue
                             l.append(x_)
                         l = np.array(l, dtype=np.float32)
                         l[:, 4:8] = xyxy2xywh(l[:,4:8])
@@ -851,7 +959,46 @@ class Rope3dDataSet(Dataset):  # for training/testing
                 else:
                     nm += 1  # label missing
                     l = np.zeros((0, 15), dtype=np.float32)
-                x[im_file] = [l, shape, segments]
+                
+                if os.path.isfile(ext_file):
+                    with open(ext_file, 'r') as ext_f:
+                        cont = ext_f.read()
+                        ext = yaml.safe_load(cont)
+                        r = ext['transform']['rotation']
+                        t = ext['transform']['translation']
+                        q = Quaternion(r['w'], r['x'], r['y'], r['z'])
+                        m = q.rotation_matrix
+                        m = np.matrix(m).reshape((3, 3))
+                        t = np.matrix([t['x'], t['y'], t['z']]).T
+                        p1 = np.vstack((np.hstack((m, t)), np.array([0, 0, 0, 1])))
+                        world2camera = np.array(p1.I).reshape((4, 4))
+                else:
+                    world2camera = np.ones((4, 4))
+
+                if os.path.isfile(calib_file):
+                    p2 = np.zeros([4, 4], dtype=float)
+                    with open(calib_file, 'r') as cal_f:
+                        for mat_line in cal_f:
+                            mat = mat_line.split('\n')[0].split(' ')
+                            if mat is not None and mat[0] == 'P2:':
+                                p2[0, 0] = mat[1]
+                                p2[0, 1] = mat[2]
+                                p2[0, 2] = mat[3]
+                                p2[0, 3] = mat[4]
+                                p2[1, 0] = mat[5]
+                                p2[1, 1] = mat[6]
+                                p2[1, 2] = mat[7]
+                                p2[1, 3] = mat[8]
+                                p2[2, 0] = mat[9]
+                                p2[2, 1] = mat[10]
+                                p2[2, 2] = mat[11]
+                                p2[2, 3] = mat[12]
+                                p2[3, 3] = 1
+                else:
+                    p2 = np.zeros([4, 4], dtype=float)
+
+                
+                x[im_file] = [l, shape, world2camera, p2]
             except Exception as e:
                 nc += 1
                 print(f'{prefix}WARNING: Ignoring corrupted image and/or label {im_file}: {e}')
@@ -916,10 +1063,19 @@ class Rope3dDataSet(Dataset):  # for training/testing
             if labels.size:  # normalized xywh to pixel xyxy format
                 labels[:, 4:8] = xywhn2xyxy(labels[:, 4:8], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1])
 
+        p2 = self.p2_mats[index].copy()
+
+        p2[0,0] = p2[0,0] * ratio[0] * (w / w0)
+        p2[0,2] = p2[0,2] * ratio[0] * (w / w0) + pad[0]    #中心偏移
+        p2[1,1] = p2[1,1] * ratio[1] * (h / h0)
+        p2[1,2] = p2[1,2] * ratio[1] * (h / h0) + pad[1] 
+
+        w2c = self.w2c_mats[index]
+            
         if self.augment:
             # Augment imagespace
             if not mosaic:
-                img, labels = random_perspective_3D(img, labels,
+                img, labels, p2 = random_perspective_3D(img, labels, p2,
                                                  degrees=hyp['degrees'],
                                                  translate=hyp['translate'],
                                                  scale=hyp['scale'],
@@ -962,12 +1118,19 @@ class Rope3dDataSet(Dataset):  # for training/testing
                 img = np.flipud(img)
                 if nL:
                     labels[:, 5] = 1 - labels[:, 5]
+                    labels[:, 12] *= np.array((-1), dtype=np.float32)
+                p2[1,2] = h - p2[1,2]     
+                
 
             # flip left-right
             if random.random() < hyp['fliplr']:
                 img = np.fliplr(img)
                 if nL:
                     labels[:, 4] = 1 - labels[:, 4]
+                    labels[:, 11] *= np.array((-1), dtype=np.float32)
+                    labels[:, 14] = labels[:, 14] * np.array((-1), dtype=np.float32) + np.pi
+                p2[0,2] = w - p2[0, 2] - 1
+
 
         labels_out = torch.zeros((nL, 16))
         if nL:
@@ -977,20 +1140,20 @@ class Rope3dDataSet(Dataset):  # for training/testing
         img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
         img = np.ascontiguousarray(img)
 
-        return torch.from_numpy(img), labels_out, self.img_files[index], shapes
+        return torch.from_numpy(img), labels_out, self.img_files[index], shapes, p2, w2c
 
     @staticmethod
     def collate_fn(batch):
-        img, label, path, shapes = zip(*batch)  # transposed
+        img, label, path, shapes, p2, w2c = zip(*batch)  # transposed
         for i, l in enumerate(label):
             l[:, 0] = i  # add target image index for build_targets()
-        return torch.stack(img, 0), torch.cat(label, 0), path, shapes
+        return torch.stack(img, 0), torch.cat(label, 0), path, shapes, np.stack(p2,0), np.stack(w2c,0)
 
     @staticmethod
     def collate_fn4(batch):
-        img, label, path, shapes = zip(*batch)  # transposed
+        img, label, path, shapes, p2s, w2cs = zip(*batch)  # transposed
         n = len(shapes) // 4
-        img4, label4, path4, shapes4 = [], [], path[:n], shapes[:n]
+        img4, label4, path4, shapes4, p2s4, w2cs4 = [], [], path[:n], shapes[:n], p2s[:n], w2cs[:n]
 
         ho = torch.tensor([[0., 0, 0, 1, 0, 0]])
         wo = torch.tensor([[0., 0, 1, 0, 0, 0]])
@@ -1010,7 +1173,7 @@ class Rope3dDataSet(Dataset):  # for training/testing
         for i, l in enumerate(label4):
             l[:, 0] = i  # add target image index for build_targets()
 
-        return torch.stack(img4, 0), torch.cat(label4, 0), path4, shapes4
+        return torch.stack(img4, 0), torch.cat(label4, 0), path4, shapes4, torch.stack(p2s4,0), torch.stack(w2cs4,0)
 
 
 # Ancillary functions --------------------------------------------------------------------------------------------------
@@ -1453,13 +1616,16 @@ def random_perspective(img, targets=(), segments=(), degrees=10, translate=.1, s
 
     return img, targets
 
-def random_perspective_3D(img, targets=(), segments=(), degrees=10, translate=.1, scale=.1, shear=10, perspective=0.0,
+def random_perspective_3D(img, targets=(), p2 = np.zeros([4, 4], dtype=float), segments=(), degrees=10, translate=.1, scale=.1, shear=10, perspective=0.0,
                        border=(0, 0)):
     # torchvision.transforms.RandomAffine(degrees=(-10, 10), translate=(.1, .1), scale=(.9, 1.1), shear=(-10, 10))
     # targets = [cls, xyxy]
 
     height = img.shape[0] + border[0] * 2  # shape(h,w,c)
     width = img.shape[1] + border[1] * 2
+
+    p2[0,2] = p2[0,2] - width / 2
+    p2[1,2] = p2[1,2] - height / 2
 
     # Center
     C = np.eye(3)
@@ -1474,23 +1640,37 @@ def random_perspective_3D(img, targets=(), segments=(), degrees=10, translate=.1
     # Rotation and Scale
     R = np.eye(3)
     a = random.uniform(-degrees, degrees)
+    # a = 15
     # a += random.choice([-180, -90, 0, 90])  # add 90deg rotations to small rotations
-    s = random.uniform(1 - scale, 1.1 + scale)
+    s = random.uniform(1 - scale, 1 + scale)
     # s = 2 ** random.uniform(-scale, scale)
     R[:2] = cv2.getRotationMatrix2D(angle=a, center=(0, 0), scale=s)
+
+    p2[:3, :3] = R @ p2[:3, :3]
 
     # Shear
     S = np.eye(3)
     S[0, 1] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # x shear (deg)
     S[1, 0] = math.tan(random.uniform(-shear, shear) * math.pi / 180)  # y shear (deg)
 
+    p2[:3, :3] = S @ p2[:3, :3]
+
     # Translation
     T = np.eye(3)
     T[0, 2] = random.uniform(0.5 - translate, 0.5 + translate) * width  # x translation (pixels)
     T[1, 2] = random.uniform(0.5 - translate, 0.5 + translate) * height  # y translation (pixels)
 
+    p2[0,2] = p2[0,2] + T[0, 2]
+    p2[1,2] = p2[1,2] + T[1, 2]
     # Combined rotation matrix
     M = T @ S @ R @ P @ C  # order of operations (right to left) is IMPORTANT
+    # print(T)
+    # print(S)
+    # print(R)
+    # print(P)
+    # print(C)
+    # print(M)
+    # print(p2)
     if (border[0] != 0) or (border[1] != 0) or (M != np.eye(3)).any():  # image changed
         if perspective:
             img = cv2.warpPerspective(img, M, dsize=(width, height), borderValue=(114, 114, 114))
@@ -1537,10 +1717,14 @@ def random_perspective_3D(img, targets=(), segments=(), degrees=10, translate=.1
 
         # filter candidates
         i = box_candidates(box1=targets[:, 4:8].T * s, box2=new.T, area_thr=0.01 if use_segments else 0.10)
+        # i = box_candidates(box1=targets[:, 1:5].T * s, box2=new.T, area_thr=0.01 if use_segments else 0.10)
+        
         targets = targets[i]
+        # targets[:, 1:5] = new[i]
         targets[:, 4:8] = new[i]
 
-    return img, targets
+
+    return img, targets, p2
 
 def box_candidates(box1, box2, wh_thr=2, ar_thr=20, area_thr=0.1, eps=1e-16):  # box1(4,n), box2(4,n)
     # Compute candidate boxes: box1 before augment, box2 after augment, wh_thr (pixels), aspect_ratio_thr, area_ratio

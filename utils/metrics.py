@@ -77,7 +77,6 @@ def ap_per_class(tp, conf, pred_cls, target_cls, v5_metric=False, plot=False, sa
     i = f1.mean(0).argmax()  # max F1 index
     return p[:, i], r[:, i], ap, f1[:, i], unique_classes.astype('int32')
 
-
 def compute_ap(recall, precision, v5_metric=False):
     """ Compute the average precision, given the recall and precision curves
     # Arguments
@@ -128,9 +127,9 @@ class ConfusionMatrix:
         Returns:
             None, updates confusion matrix accordingly
         """
-        detections = detections[detections[:, 4] > self.conf]
+        detections = detections[detections[:, 11] > self.conf]
         gt_classes = labels[:, 0].int()
-        detection_classes = detections[:, 5].int()
+        detection_classes = detections[:, 12].int()
         iou = general.box_iou(labels[:, 1:], detections[:, :4])
 
         x = torch.where(iou > self.iou_thres)
@@ -205,6 +204,8 @@ def plot_pr_curve(px, py, ap, save_dir='pr_curve.png', names=()):
     ax.set_ylim(0, 1)
     plt.legend(bbox_to_anchor=(1.04, 1), loc="upper left")
     fig.savefig(Path(save_dir), dpi=250)
+    plt.close()
+
 
 
 def plot_mc_curve(px, py, save_dir='mc_curve.png', names=(), xlabel='Confidence', ylabel='Metric'):
@@ -225,3 +226,4 @@ def plot_mc_curve(px, py, save_dir='mc_curve.png', names=(), xlabel='Confidence'
     ax.set_ylim(0, 1)
     plt.legend(bbox_to_anchor=(1.04, 1), loc="upper left")
     fig.savefig(Path(save_dir), dpi=250)
+    plt.close()
