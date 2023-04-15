@@ -21,8 +21,11 @@
 2. 3d bbox loss 
     
     3d中心点投影偏移：L1
+
     深度：LaplacianAleatoricUncertaintyLoss
+
     3d尺寸：L1（DimAwareL1经常出现梯度问题）
+    
     角度：L1
 
     后续有待优化

@@ -265,7 +265,11 @@ crashlytics.properties
 crashlytics-build.properties
 fabric.properties
 
-rope*
+rope_3d/
+data/rope3d_mini.yaml
+visualize/rope3d_mini_res
+visualize/rope3d-dataset-tools/show_tools/*/
+visualize/rope3d-dataset-tools/eval_tools
 *.out
 det_evaluators.py
 evaluate.py

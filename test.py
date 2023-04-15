@@ -20,7 +20,6 @@ from utils.torch_utils import select_device, time_synchronized, TracedModel
 from utils.trans_3d import decodePred
 from utils.trans_3d import *
 
-CLASS = ['car', 'van', 'truck', 'bus', 'pedestrian', 'cyclist', 'motorcyclist', 'barrow', 'tricyclist']
 
 def buildTar(targets, p2s, w2cs):
     out = [torch.zeros((0, 15), device=targets.device).float()] * p2s.shape[0]
@@ -95,6 +94,7 @@ def test(data,
     nc = 1 if single_cls else int(data['nc'])  # number of classes
     iouv = torch.linspace(0.5, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
     niou = iouv.numel()
+    CLASS = data['names']
 
     # Logging
     log_imgs = 0

@@ -1,0 +1,14 @@
+# train and val data as 1) directory: path/images/, 2) file: path/images.txt, or 3) list: [path1/images/, path2/images/]
+# train: data/Baidu_Rope3d_mini/training/image/
+# val: data/Baidu_Rope3d_mini/validation/image/
+# test: data/Baidu_Rope3d_mini/validation/image/
+
+train: data/Baidu_Rope3d/training/image/
+val: data/Baidu_Rope3d/validation/image/
+test: data/Baidu_Rope3d/validation/image/
+
+# number of classes
+nc: 9
+
+# class names
+names: ['car', 'van', 'truck', 'bus', 'pedestrian', 'cyclist', 'motorcyclist', 'barrow', 'tricyclist']

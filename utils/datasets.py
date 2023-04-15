@@ -238,32 +238,53 @@ class LoadImages:  # for inference
 class LoadImages_3D:  # for inference
     def __init__(self, path, img_size=640, stride=32):
         p = str(Path(path).absolute())  # os-agnostic absolute path
-        if '*' in p:
-            files = sorted(glob.glob(p, recursive=True))  # glob
-        elif os.path.isdir(p):
-            files = sorted(glob.glob(os.path.join(p, '*.*')))  # dir
-        elif os.path.isfile(p):
-            files = [p]  # files
-        else:
-            raise Exception(f'ERROR: {p} does not exist')
+        self.mode = 'image'
 
-        images = [x for x in files if x.split('.')[-1].lower() in img_formats]
-        videos = [x for x in files if x.split('.')[-1].lower() in vid_formats]
-        ni, nv = len(images), len(videos)
+        # if p is file, raise error, if p's sub directory does not contain "image", "calib", "extrinsic", raise error
+        if os.path.isfile(p):
+            raise Exception(f'ERROR: {p} is not a directory')
+        elif not os.path.isdir(os.path.join(p, "image")):
+            raise Exception(f'ERROR: {p} does not contain "image" directory')
+        elif not os.path.isdir(os.path.join(p, "calib")):
+            raise Exception(f'ERROR: {p} does not contain "calib" directory')
+        elif not os.path.isdir(os.path.join(p, "extrinsics")):
+            raise Exception(f'ERROR: {p} does not contain "extrinsic" directory')
+        else:
+            self.img_path = os.path.join(p, "image")
+            self.calib_path = os.path.join(p, "calib")
+            self.extrinsic_path = os.path.join(p, "extrinsics")
+        
+        # check if each image has corresponding calib and extrinsic
+        img_files = sorted(glob.glob(os.path.join(self.img_path, '*.*')))
+        # calib_files = sorted(glob.glob(os.path.join(self.calib_path, '*.*')))
+        # extrinsic_files = sorted(glob.glob(os.path.join(self.extrinsic_path, '*.*')))
+        self.images = []
+        self.calibs = []
+        self.extrinsics = []
+        for img_file in img_files:
+            if img_file.split('.')[-1].lower() not in img_formats:
+                print(f'ERROR: {img_file} is not an image')
+                continue
+            img_name = os.path.basename(img_file)
+            calib_name = img_name.split('.')[0] + ".txt"
+            extrinsic_name = img_name.split('.')[0] + ".yaml"
+            if not os.path.isfile(os.path.join(self.calib_path, calib_name)):
+                print(f'ERROR: {calib_name} does not exist in {self.calib_path}')
+                continue
+            if not os.path.isfile(os.path.join(self.extrinsic_path, extrinsic_name)):
+                print(f'ERROR: {extrinsic_name} does not exist in {self.extrinsic_path}')
+                continue
+            self.images.append(img_file)
+            self.calibs.append(os.path.join(self.calib_path, calib_name))
+            self.extrinsics.append(os.path.join(self.extrinsic_path, extrinsic_name))
 
         self.img_size = img_size
         self.stride = stride
-        self.files = images + videos
-        self.nf = ni + nv  # number of files
-        self.video_flag = [False] * ni + [True] * nv
-        self.mode = 'image'
-        if any(videos):
-            self.new_video(videos[0])  # new video
-        else:
-            self.cap = None
-        assert self.nf > 0, f'No images or videos found in {p}. ' \
-                            f'Supported formats are:\nimages: {img_formats}\nvideos: {vid_formats}'
+        self.nf = len(self.images) # number of files
 
+        assert self.nf > 0, f'No images found in {p}. ' \
+                            f'Supported formats are:\nimages: {img_formats}\n'
+        
     def __iter__(self):
         self.count = 0
         return self
@@ -271,45 +292,68 @@ class LoadImages_3D:  # for inference
     def __next__(self):
         if self.count == self.nf:
             raise StopIteration
-        path = self.files[self.count]
+        img_p = self.images[self.count]
+        # Read image
+        img0 = cv2.imread(img_p)  # BGR
+        assert img0 is not None, 'Image Not Found ' + img_p
 
-        if self.video_flag[self.count]:
-            # Read video
-            self.mode = 'video'
-            ret_val, img0 = self.cap.read()
-            if not ret_val:
-                self.count += 1
-                self.cap.release()
-                if self.count == self.nf:  # last video
-                    raise StopIteration
-                else:
-                    path = self.files[self.count]
-                    self.new_video(path)
-                    ret_val, img0 = self.cap.read()
-
-            self.frame += 1
-            print(f'video {self.count + 1}/{self.nf} ({self.frame}/{self.nframes}) {path}: ', end='')
-
+        if os.path.isfile(self.extrinsics[self.count]):
+            with open(self.extrinsics[self.count], 'r') as ext_f:
+                cont = ext_f.read()
+                ext = yaml.safe_load(cont)
+                r = ext['transform']['rotation']
+                t = ext['transform']['translation']
+                q = Quaternion(r['w'], r['x'], r['y'], r['z'])
+                m = q.rotation_matrix
+                m = np.matrix(m).reshape((3, 3))
+                t = np.matrix([t['x'], t['y'], t['z']]).T
+                p1 = np.vstack((np.hstack((m, t)), np.array([0, 0, 0, 1])))
+                world2camera = np.array(p1.I).reshape((4, 4))
         else:
-            # Read image
-            self.count += 1
-            img0 = cv2.imread(path)  # BGR
-            assert img0 is not None, 'Image Not Found ' + path
-            #print(f'image {self.count}/{self.nf} {path}: ', end='')
+            world2camera = np.ones((4, 4))
+        
+        if os.path.isfile(self.calibs[self.count]):
+            p2_0 = np.zeros([4, 4], dtype=float)
+            with open(self.calibs[self.count], 'r') as cal_f:
+                for mat_line in cal_f:
+                    mat = mat_line.split('\n')[0].split(' ')
+                    if mat is not None and mat[0] == 'P2:':
+                        p2_0[0, 0] = mat[1]
+                        p2_0[0, 1] = mat[2]
+                        p2_0[0, 2] = mat[3]
+                        p2_0[0, 3] = mat[4]
+                        p2_0[1, 0] = mat[5]
+                        p2_0[1, 1] = mat[6]
+                        p2_0[1, 2] = mat[7]
+                        p2_0[1, 3] = mat[8]
+                        p2_0[2, 0] = mat[9]
+                        p2_0[2, 1] = mat[10]
+                        p2_0[2, 2] = mat[11]
+                        p2_0[2, 3] = mat[12]
+                        p2_0[3, 3] = 1
+        else:
+            p2_0 = np.zeros([4, 4], dtype=float)
+
+        #print(f'image {self.count}/{self.nf} {path}: ', end='')
 
         # Padded resize
-        img = letterbox(img0, self.img_size, stride=self.stride)[0]
-
+        h0, w0 = img0.shape[:2]  # orig hw
+        img, ratio, pad  = letterbox(img0, self.img_size, stride=self.stride)
+        h, w = img.shape[:2]  # new hw
+        p2_ = p2_0.copy()
+        shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
+        p2_[0,0] = p2_[0,0] * ratio[0]
+        p2_[0,2] = p2_[0,2] * ratio[0] + pad[0]    #中心偏移
+        p2_[1,1] = p2_[1,1] * ratio[1]
+        p2_[1,2] = p2_[1,2] * ratio[1] + pad[1] 
+        
         # Convert
         img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
         img = np.ascontiguousarray(img)
 
-        return path, img, img0, self.cap
-
-    def new_video(self, path):
-        self.frame = 0
-        self.cap = cv2.VideoCapture(path)
-        self.nframes = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.count += 1
+        
+        return img, img0, p2_, p2_0, world2camera, shapes, img_p
 
     def __len__(self):
         return self.nf  # number of files
